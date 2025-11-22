@@ -135,3 +135,8 @@ This is an upstream change that conflicts
 # Different from gitofgist's change
 # ==========================================
 
+
+# ==========================================
+# NEW FEATURE v3.1.8 - AUTHENTICATION
+# This will conflict with gitofgist's next patch
+# ==========================================
