@@ -127,3 +127,16 @@ better way to solve the same problem, a Pull Request with your solution would mo
 welcome! Likewise, if rewriting a test can better communicate what code it's protecting, please
 send us that patch!
 
+# ===== UPSTREAM FEATURE (WILL CONFLICT) =====
+This is an upstream change that conflicts
+
+# ==========================================
+# UPSTREAM FEATURE v3.1.7 - WILL CONFLICT!
+# Different from gitofgist's change
+# ==========================================
+
+
+# ==========================================
+# NEW FEATURE v3.1.8 - AUTHENTICATION
+# This will conflict with gitofgist's next patch
+# ==========================================
