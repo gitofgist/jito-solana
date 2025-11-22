@@ -129,3 +129,9 @@ send us that patch!
 
 # ===== UPSTREAM FEATURE (WILL CONFLICT) =====
 This is an upstream change that conflicts
+
+# ==========================================
+# UPSTREAM FEATURE v3.1.7 - WILL CONFLICT!
+# Different from gitofgist's change
+# ==========================================
+
