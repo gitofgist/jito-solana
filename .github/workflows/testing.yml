@@ -1,0 +1,297 @@
+name: testing sync
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      target_version:
+        description: "Specific version to patch (e.g., v3.0.10-jito)"
+        required: false
+        type: string
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout private repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.TOKEN }}
+
+      - name: Set up Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream https://github.com/rishavmehra/jito-solana.git || true
+          git fetch --all --tags
+
+      - name: Detect default branch
+        run: |
+          DEFAULT_BRANCH=$(git remote show origin | grep 'HEAD branch' | cut -d' ' -f5)
+          echo "Default branch detected: $DEFAULT_BRANCH"
+          echo "DEFAULT_BRANCH=$DEFAULT_BRANCH" >> "$GITHUB_ENV"
+
+      - name: Sync tags only
+        run: |
+          git push origin --tags
+          echo "Tags synced successfully"
+
+      - name: Find target version
+        run: |
+          if [ -n "${{ github.event.inputs.target_version }}" ]; then
+            TARGET_TAG="${{ github.event.inputs.target_version }}"
+          else
+            TARGET_TAG=$(git tag -l "v*-jito" | sort -V | tail -n1)
+          fi
+          
+          if [ -z "$TARGET_TAG" ]; then
+            echo "No jito tags found"
+            exit 1
+          fi
+          
+          echo "Target: $TARGET_TAG"
+          echo "TARGET_TAG=$TARGET_TAG" >> "$GITHUB_ENV"
+
+      - name: Find best patch source
+        run: |
+          if ! git show-ref --verify --quiet refs/remotes/origin/brew/patch; then
+            echo "First run - no brew/patch exists"
+            echo "PATCH_STATUS=first_run" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          
+          CONFLICT_BRANCH=$(git branch -r | grep "origin/brew/patch-conflicts-" | sort -V | tail -n1 | xargs)
+          
+          if [ -n "$CONFLICT_BRANCH" ]; then
+            echo "Found conflict branch: $CONFLICT_BRANCH"
+            git checkout "$CONFLICT_BRANCH"
+            CONFLICT_BASE=$(git describe --tags --abbrev=0 "$(git merge-base $CONFLICT_BRANCH upstream/master)")
+            
+            git checkout origin/brew/patch
+            PATCH_BASE=$(git describe --tags --abbrev=0 "$(git merge-base origin/brew/patch upstream/master)")
+            
+            echo "Conflict branch base: $CONFLICT_BASE"
+            echo "brew/patch base: $PATCH_BASE"
+            
+            NEWER=$(printf "%s\n%s" "$PATCH_BASE" "$CONFLICT_BASE" | sort -V | tail -n1)
+            if [ "$NEWER" = "$CONFLICT_BASE" ]; then
+              SOURCE="$CONFLICT_BRANCH"
+              BASE="$CONFLICT_BASE"
+              echo "Using conflict branch (newer): $BASE"
+            else
+              SOURCE="origin/brew/patch"
+              BASE="$PATCH_BASE"
+              echo "Using brew/patch: $BASE"
+            fi
+          else
+            SOURCE="origin/brew/patch"
+            git checkout origin/brew/patch
+            BASE=$(git describe --tags --abbrev=0 "$(git merge-base origin/brew/patch upstream/master)")
+            echo "Using brew/patch: $BASE"
+          fi
+          
+          if [ "$BASE" = "$TARGET_TAG" ]; then
+            echo "Already on $TARGET_TAG"
+            echo "PATCH_STATUS=up_to_date" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          
+          git checkout "$SOURCE"
+          mkdir -p /tmp/patches
+          git format-patch "$BASE"..HEAD -o /tmp/patches/
+          
+          PATCH_COUNT=$(ls -1 /tmp/patches/*.patch 2>/dev/null | wc -l)
+          
+          echo "CURRENT_BASE=$BASE" >> "$GITHUB_ENV"
+          echo "PATCH_COUNT=$PATCH_COUNT" >> "$GITHUB_ENV"
+          echo "Extracted $PATCH_COUNT patches from $BASE"
+
+      - name: Create initial brew/patch
+        if: env.PATCH_STATUS == 'first_run'
+        run: |
+          echo "Creating initial brew/patch on $TARGET_TAG"
+          git checkout -B brew/patch "$TARGET_TAG"
+          git push origin brew/patch --force-with-lease
+          git checkout -B "brew/$TARGET_TAG-patch"
+          git push origin "brew/$TARGET_TAG-patch" --force
+          echo "Initial brew/patch created"
+
+      - name: Apply patches
+        if: env.PATCH_STATUS != 'up_to_date' && env.PATCH_STATUS != 'first_run'
+        run: |
+          git checkout -B brew/patch "$TARGET_TAG"
+          
+          if [ -d /tmp/patches ] && [ "$(ls -A /tmp/patches 2>/dev/null)" ]; then
+            echo "Applying $PATCH_COUNT patches to $TARGET_TAG..."
+            
+            if git am /tmp/patches/*.patch; then
+              echo "Patches applied successfully"
+              echo "PATCH_STATUS=success" >> "$GITHUB_ENV"
+              git push origin brew/patch --force-with-lease
+            else
+              echo "Conflicts detected"
+              echo "PATCH_STATUS=conflicts" >> "$GITHUB_ENV"
+              
+              CONFLICT_BRANCH="brew/patch-conflicts-$TARGET_TAG"
+              echo "CONFLICT_BRANCH=$CONFLICT_BRANCH" >> "$GITHUB_ENV"
+              
+              git checkout -B "$CONFLICT_BRANCH"
+              git push origin "$CONFLICT_BRANCH" --force
+              
+              git am --abort || true
+              
+              echo "brew/patch stays on $CURRENT_BASE"
+            fi
+          else
+            echo "No patches to apply"
+            echo "PATCH_STATUS=no_patches" >> "$GITHUB_ENV"
+            git push origin brew/patch --force-with-lease
+          fi
+
+      - name: Create version branch
+        if: env.PATCH_STATUS == 'success' || env.PATCH_STATUS == 'no_patches'
+        run: |
+          git checkout brew/patch
+          git checkout -B "brew/$TARGET_TAG-patch"
+          git push origin "brew/$TARGET_TAG-patch" --force
+          echo "Created brew/$TARGET_TAG-patch"
+
+      - name: Cleanup old conflicts
+        if: env.PATCH_STATUS == 'success'
+        run: |
+          echo "Cleaning up old conflict branches..."
+          OLD_BRANCHES=$(git branch -r | grep "origin/brew/patch-conflicts-" | sed 's|origin/||' | xargs)
+          
+          if [ -n "$OLD_BRANCHES" ]; then
+            for branch in $OLD_BRANCHES; do
+              echo "Deleting: $branch"
+              git push origin --delete "$branch" || true
+            done
+            echo "Cleanup complete"
+          else
+            echo "No old conflict branches found"
+          fi
+
+      - name: Create PR
+        if: always() && env.PATCH_STATUS != 'up_to_date' && env.PATCH_STATUS != ''
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+        run: |
+          echo "========================================"
+          echo "PR Creation"
+          echo "========================================"
+          echo "Status: $PATCH_STATUS"
+          echo "Target: $TARGET_TAG"
+          echo "Base: $CURRENT_BASE"
+          echo "Default Branch: $DEFAULT_BRANCH"
+          echo "========================================"
+          
+          if [ "$PATCH_STATUS" = "conflicts" ]; then
+            echo "Creating conflict PR for $CONFLICT_BRANCH..."
+            
+            EXISTING=$(gh pr list --head "$CONFLICT_BRANCH" --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
+            
+            if [ -n "$EXISTING" ]; then
+              echo "PR already exists: #$EXISTING"
+            else
+              gh pr create \
+                --repo ${{ github.repository }} \
+                --title "🔴 Conflicts: $TARGET_TAG needs manual fix" \
+                --body "## Patch Conflicts Detected
+          
+          **Target Version:** \`$TARGET_TAG\`  
+          **Previous Version:** \`$CURRENT_BASE\`  
+          **Patches Attempted:** $PATCH_COUNT  
+          **Conflict Branch:** \`$CONFLICT_BRANCH\`
+          
+          ### How to Fix
+          
+          \`\`\`bash
+          git fetch origin
+          git checkout $CONFLICT_BRANCH
+          git status
+          git add <file>
+          git am --continue
+          git push origin HEAD:brew/patch --force-with-lease
+          \`\`\`
+          
+          ### Important
+          - \`brew/patch\` stays on \`$CURRENT_BASE\` until fixed
+          - Future releases will use this conflict branch as base" \
+                --base "$DEFAULT_BRANCH" \
+                --head "$CONFLICT_BRANCH"
+              
+              echo "Conflict PR created successfully"
+            fi
+          
+          elif [ "$PATCH_STATUS" = "success" ]; then
+            echo "Creating success PR..."
+            
+            EXISTING=$(gh pr list --head "brew/patch" --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
+            
+            if [ -n "$EXISTING" ]; then
+              echo "PR already exists: #$EXISTING"
+            else
+              gh pr create \
+                --repo ${{ github.repository }} \
+                --title "✅ Updated to $TARGET_TAG" \
+                --body "## Automated Patch Update
+          
+          **New Version:** \`$TARGET_TAG\`  
+          **Previous:** \`$CURRENT_BASE\`  
+          **Patches:** $PATCH_COUNT  
+          
+          All patches applied successfully!" \
+                --base "$DEFAULT_BRANCH" \
+                --head "brew/patch"
+              
+              echo "Success PR created"
+            fi
+          
+          elif [ "$PATCH_STATUS" = "first_run" ] || [ "$PATCH_STATUS" = "no_patches" ]; then
+            echo "Creating initialization PR..."
+            
+            EXISTING=$(gh pr list --head "brew/patch" --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
+            
+            if [ -n "$EXISTING" ]; then
+              echo "PR already exists: #$EXISTING"
+            else
+              gh pr create \
+                --repo ${{ github.repository }} \
+                --title "📦 Initialize brew/patch on $TARGET_TAG" \
+                --body "**Version:** \`$TARGET_TAG\`
+          
+          Initial brew/patch setup complete." \
+                --base "$DEFAULT_BRANCH" \
+                --head "brew/patch"
+              
+              echo "Initialization PR created"
+            fi
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "========================================"
+          echo "Workflow Summary"
+          echo "========================================"
+          echo "Target: $TARGET_TAG"
+          echo "Previous: ${CURRENT_BASE:-N/A}"
+          echo "Patches: ${PATCH_COUNT:-0}"
+          echo "Status: ${PATCH_STATUS:-unknown}"
+          echo "Default Branch: $DEFAULT_BRANCH"
+          echo "========================================"
+          
+          if [ "$PATCH_STATUS" = "success" ]; then
+            echo "brew/patch updated to $TARGET_TAG"
+          elif [ "$PATCH_STATUS" = "conflicts" ]; then
+            echo "Conflicts - check PR for instructions"
+          elif [ "$PATCH_STATUS" = "up_to_date" ]; then
+            echo "Already up to date"
+          fi
